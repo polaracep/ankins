@@ -22,7 +22,7 @@ struct Args {
     file: String,
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Clone)]
 struct AnkiNote {
     side_a: String,
     side_b: String,
@@ -42,7 +42,7 @@ fn main() {
     let path = Path::new(&args.file);
     let file_string = read_file_to_string(path);
 
-    let input_lines: Vec<String> = file_string.lines().map(|l| l.to_string()).collect();
+    let mut input_lines: Vec<String> = file_string.lines().map(|l| l.to_string()).collect();
 
     let mut lines_iter = input_lines.iter();
     let mut line_count = 0;
@@ -66,20 +66,20 @@ fn main() {
         }
 
         line_count += 1;
-        let id: i64;
+        let note_id: i64;
 
         // already has an id
         if next.contains(ID_DELIMETER) {
             // mame id
             let line_split: Vec<&str> = next.split(ID_DELIMETER).collect();
-            id = parse_id(line_split.get(1).unwrap_or(&"0"));
-            if id == 0 {
+            note_id = parse_id(line_split.get(1).unwrap_or(&"0"));
+            if note_id == 0 {
                 eprintln!("Bad id at {}.", line_count);
                 continue;
             }
             next = line_split.get(0).unwrap();
         } else {
-            id = 0;
+            note_id = 0;
         }
 
         let word_pair: Vec<&str> = next.split("::").collect();
@@ -105,7 +105,7 @@ fn main() {
         }
 
         // id uz existuje
-        if note_db.iter().any(|c| c.id == id && id != 0) {
+        if note_db.iter().any(|c| c.id == note_id && note_id != 0) {
             eprintln!("Duplicate id at line {}.", line_count);
             continue;
         }
@@ -113,64 +113,64 @@ fn main() {
         note_db.push(AnkiNote {
             side_a: word_a,
             side_b: word_b,
-            id: id,
+            id: note_id,
         });
     }
 
     let anki = AnkiClient::default();
 
-    let note_ids = anki_get_notes(&anki, deck_name);
+    let all_note_ids_dist = anki_get_notes(&anki, deck_name);
+    let all_notes_dist = anki_get_notes_info(&anki, &all_note_ids_dist);
 
-    dbg!(&note_ids);
+    dbg!(&note_db);
+    dbg!(&all_note_ids_dist);
 
     let mut new_notes: Vec<AnkiNote> = vec![];
     let mut old_notes: Vec<AnkiNote> = vec![];
 
-    note_db.into_iter().for_each(|c| {
-        if note_ids.contains(&c.id) {
-            old_notes.push(c);
-        } else {
-            new_notes.push(c);
+    for note_info in all_notes_dist {
+        for n in note_db.iter_mut() {
+            if n.side_a.trim() != note_info.fields["Front"].value.trim()
+                || n.side_b.trim() != note_info.fields["Back"].value.trim()
+            {
+                if n.id != note_info.note_id {
+                    continue;
+                } else {
+                    // note exists, try to update
+                    println!("Updating note: {}.", note_info.note_id);
+                    anki_update_note(&anki, &n);
+                    dbg!("+1");
+                    if old_notes.contains(&n) {
+                        panic!("Duplicates in old_notes!");
+                    }
+                    old_notes.push(n.clone());
+                }
+            } else {
+                if n.id == 0 {
+                    println!("Restoring note id {} back", note_info.note_id);
+                    n.id = note_info.note_id;
+                }
+
+                if !old_notes.contains(&n) {
+                    old_notes.push(n.clone());
+                }
+            }
         }
-    });
+        //let current_note = &old_notes[i];
+    }
+
+    //for (i, note) in old_notes_dist.iter().enumerate() {}
 
     dbg!(&new_notes);
     dbg!(&old_notes);
 
-    let old_notes_dist = anki_get_notes_info(&anki, old_notes.iter().map(|n| n.id).collect());
-
-    for (i, note) in old_notes_dist.iter().enumerate() {
-        let current_note = &old_notes[i];
-        if current_note.side_a.trim() != note.fields["Front"].value
-            || current_note.side_b.trim() != note.fields["Back"].value
-        {
-            println!("Updating note: {}.", note.note_id);
-            anki_update_note(&anki, current_note);
-        }
-    }
-
     let mut new_notes_ids = anki_add_notes(&anki, &new_notes, deck_name);
-    let mut input_lines = input_lines;
 
-    for note in new_notes.iter_mut().rev() {
+    // append id numbers
+    for note in new_notes.iter_mut() {
         // id uz mame
-        if note.id != 0 {
-            println!("{} Already has an id", note.id);
-            continue;
-        }
-        // nove id + append do souboru
-        note.id = new_notes_ids.pop().expect("Failed to assign ids to notes.");
-        let find_string: String = note.side_a.to_string() + "::" + &note.side_b;
-
-        let line_n: usize;
-        match &input_lines.iter().position(|x| x.contains(&find_string)) {
-            Some(n) => line_n = *n,
-            None => {
-                eprintln!("Couldn't find the pair in the file.");
-                continue;
-            }
-        }
-        input_lines[line_n] += &("  ".to_string() + ID_DELIMETER + &note.id.to_string());
+        let new_id = new_notes_ids.pop().expect("Failed to assign ids to notes.");
+        replace_id(&mut input_lines, note, new_id);
     }
 
     let file = OpenOptions::new()
@@ -216,8 +216,10 @@ fn anki_add_notes(anki: &AnkiClient, notes: &Vec<AnkiNote>, name: &String) -> Ve
     return anki.request(request).expect("Something went wrong.");
 }
 
-fn anki_get_notes_info(anki: &AnkiClient, notes: Vec<i64>) -> Vec<NotesInfoResponse> {
-    let request = NotesInfoRequest { notes: notes };
+fn anki_get_notes_info(anki: &AnkiClient, notes_list: &Vec<i64>) -> Vec<NotesInfoResponse> {
+    let request = NotesInfoRequest {
+        notes: notes_list.clone(),
+    };
     return anki.request(request).expect("Something went wrong.");
 }
 
@@ -252,4 +254,40 @@ fn parse_id(string_id: &str) -> i64 {
         Ok(n) => return n,
         Err(_) => return 0,
     }
+}
+
+fn replace_id(file_lines: &mut Vec<String>, note: &AnkiNote, new_id: i64) {
+    let line_n: usize;
+    match file_lines
+        .iter()
+        .position(|x| x.contains(&note.id.to_string()))
+    {
+        Some(x) => line_n = x,
+        None => {
+            eprintln!("Couldn't find the correct id in the file.");
+            return;
+        }
+    }
+    let replace = file_lines[line_n]
+        .split(&("  ".to_owned() + ID_DELIMETER))
+        .nth(0)
+        .unwrap()
+        .to_string()
+        + &("  ".to_string() + ID_DELIMETER + &new_id.to_string());
+
+    println!("Line: {}, changed to: {}", line_n, replace);
+    file_lines[line_n] = replace;
+}
+
+fn append_id(file_lines: &mut Vec<String>, note: &AnkiNote) {
+    let find_string: String = note.side_a.to_string() + "::" + &note.side_b;
+    let line_n: usize;
+    match &file_lines.iter().position(|x| x.contains(&find_string)) {
+        Some(n) => line_n = *n,
+        None => {
+            eprintln!("Couldn't find the pair in the file.");
+            return;
+        }
+    }
+    file_lines[line_n] += &("  ".to_string() + ID_DELIMETER + &note.id.to_string());
 }
