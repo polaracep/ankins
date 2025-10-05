@@ -1,0 +1,255 @@
+use clap::Parser;
+use std::cmp::PartialEq;
+use std::collections::HashMap;
+use std::fs::{File, OpenOptions};
+use std::io::{BufWriter, Read, Write};
+use std::path::Path;
+
+use anki_bridge::prelude::*;
+
+const ID_DELIMETER: &str = "#id:";
+
+/// Simple program to greet a person
+#[derive(Parser, Debug)]
+#[command(version)]
+struct Args {
+    /// Deck to use
+    #[arg(short, long, default_value = "sync-default")]
+    deck: String,
+
+    /// File to sync
+    #[arg()]
+    file: String,
+}
+
+#[derive(PartialEq, Debug)]
+struct AnkiNote {
+    side_a: String,
+    side_b: String,
+    id: i64,
+}
+
+fn read_file_to_string(path: &Path) -> String {
+    let mut file = File::open(path).expect("Failed to open file");
+    let mut f_string = String::new();
+    file.read_to_string(&mut f_string)
+        .expect("File reading went wrong");
+    return f_string;
+}
+
+fn main() {
+    let args = Args::parse();
+    let path = Path::new(&args.file);
+    let file_string = read_file_to_string(path);
+
+    let input_lines: Vec<String> = file_string.lines().map(|l| l.to_string()).collect();
+
+    let mut lines_iter = input_lines.iter();
+    let mut line_count = 0;
+
+    let mut next: &str;
+
+    let mut note_db: Vec<AnkiNote> = Vec::new();
+
+    let deck_name = &args.deck;
+
+    // try and get all the notes
+    loop {
+        // next line
+        match lines_iter.next() {
+            Some(l) => next = l,
+            None => break,
+        }
+
+        if !next.contains("::") {
+            continue;
+        }
+
+        line_count += 1;
+        let id: i64;
+
+        // already has an id
+        if next.contains(ID_DELIMETER) {
+            // mame id
+            let line_split: Vec<&str> = next.split(ID_DELIMETER).collect();
+            id = parse_id(line_split.get(1).unwrap_or(&"0"));
+            if id == 0 {
+                eprintln!("Bad id at {}.", line_count);
+                continue;
+            }
+            next = line_split.get(0).unwrap();
+        } else {
+            id = 0;
+        }
+
+        let word_pair: Vec<&str> = next.split("::").collect();
+
+        match word_pair.len() {
+            0..=1 => {
+                eprintln!("No delimeters at line {}.", line_count);
+                continue;
+            }
+            2 => (),
+            _ => {
+                eprintln!("Too many delimeters at line {}.", line_count);
+                continue;
+            }
+        }
+
+        let word_a = word_pair.get(0).unwrap().to_string();
+        let word_b = word_pair.get(1).unwrap().to_string();
+
+        if word_a.is_empty() || word_b.is_empty() {
+            eprintln!("Empty pair at line {}.", line_count);
+            continue;
+        }
+
+        // id uz existuje
+        if note_db.iter().any(|c| c.id == id && id != 0) {
+            eprintln!("Duplicate id at line {}.", line_count);
+            continue;
+        }
+
+        note_db.push(AnkiNote {
+            side_a: word_a,
+            side_b: word_b,
+            id: id,
+        });
+    }
+
+    let anki = AnkiClient::default();
+
+    let note_ids = anki_get_notes(&anki, deck_name);
+
+    dbg!(&note_ids);
+
+    let mut new_notes: Vec<AnkiNote> = vec![];
+    let mut old_notes: Vec<AnkiNote> = vec![];
+
+    note_db.into_iter().for_each(|c| {
+        if note_ids.contains(&c.id) {
+            old_notes.push(c);
+        } else {
+            new_notes.push(c);
+        }
+    });
+
+    dbg!(&new_notes);
+    dbg!(&old_notes);
+
+    let old_notes_dist = anki_get_notes_info(&anki, old_notes.iter().map(|n| n.id).collect());
+
+    for (i, note) in old_notes_dist.iter().enumerate() {
+        let current_note = &old_notes[i];
+        if current_note.side_a.trim() != note.fields["Front"].value
+            || current_note.side_b.trim() != note.fields["Back"].value
+        {
+            println!("Updating note: {}.", note.note_id);
+            anki_update_note(&anki, current_note);
+        }
+    }
+
+    let mut new_notes_ids = anki_add_notes(&anki, &new_notes, deck_name);
+    let mut input_lines = input_lines;
+
+    for note in new_notes.iter_mut().rev() {
+        // id uz mame
+        if note.id != 0 {
+            println!("{} Already has an id", note.id);
+            continue;
+        }
+        // nove id + append do souboru
+        note.id = new_notes_ids.pop().expect("Failed to assign ids to notes.");
+        let find_string: String = note.side_a.to_string() + "::" + &note.side_b;
+
+        let line_n: usize;
+        match &input_lines.iter().position(|x| x.contains(&find_string)) {
+            Some(n) => line_n = *n,
+            None => {
+                eprintln!("Couldn't find the pair in the file.");
+                continue;
+            }
+        }
+        input_lines[line_n] += &("  ".to_string() + ID_DELIMETER + &note.id.to_string());
+    }
+
+    let file = OpenOptions::new()
+        .write(true)
+        .open(&args.file)
+        .expect("Failed to open the file.");
+    let mut writer = BufWriter::new(file);
+    input_lines
+        .iter()
+        .for_each(|l| writeln!(writer, "{}", l).expect("Failed to write a line the file."));
+
+    println!("Done.");
+}
+
+fn anki_add_notes(anki: &AnkiClient, notes: &Vec<AnkiNote>, name: &String) -> Vec<i64> {
+    let mut note_list: Vec<AddNoteEntry> = vec![];
+    for note in notes {
+        note_list.push(AddNoteEntry {
+            deck_name: name.clone(),
+            model_name: "Basic (and reversed card)".to_string(),
+            fields: HashMap::from([
+                ("Front".to_string(), note.side_a.trim().to_string()),
+                ("Back".to_string(), note.side_b.trim().to_string()),
+            ]),
+            options: AddNoteOptions {
+                allow_duplicate: false,
+                duplicate_scope: AddNoteDuplicateScope::Deck,
+                duplicate_scope_options: AddNoteDuplicateScopeOptions {
+                    deck_name: None,
+                    check_children: false,
+                    check_all_models: false,
+                },
+            },
+            tags: [].to_vec(),
+            audio: [].to_vec(),
+            video: [].to_vec(),
+            picture: [].to_vec(),
+        });
+    }
+
+    let request = AddNotesRequest { notes: note_list };
+
+    return anki.request(request).expect("Something went wrong.");
+}
+
+fn anki_get_notes_info(anki: &AnkiClient, notes: Vec<i64>) -> Vec<NotesInfoResponse> {
+    let request = NotesInfoRequest { notes: notes };
+    return anki.request(request).expect("Something went wrong.");
+}
+
+fn anki_get_notes(anki: &AnkiClient, deck: &str) -> Vec<i64> {
+    let mut request_str: String = "deck:".to_string();
+    request_str.push_str(deck);
+    return anki
+        .request(FindNotesRequest { query: request_str })
+        .expect("Something went wrong. Error: {}")
+        .0;
+}
+
+fn anki_update_note(anki: &AnkiClient, note: &AnkiNote) {
+    return anki
+        .request(UpdateNoteFieldsRequest {
+            note: UpdateNoteFieldsEntry {
+                id: note.id,
+                fields: HashMap::from([
+                    ("Front".to_string(), note.side_a.clone()),
+                    ("Back".to_string(), note.side_b.clone()),
+                ]),
+                audio: vec![],
+                video: vec![],
+                picture: vec![],
+            },
+        })
+        .expect("Something went wrong when updating notes.");
+}
+
+fn parse_id(string_id: &str) -> i64 {
+    match string_id.parse::<i64>() {
+        Ok(n) => return n,
+        Err(_) => return 0,
+    }
+}

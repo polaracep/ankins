@@ -1,0 +1,6 @@
+Nejaky nadpis
+A::B
+test::brambor
+::
+12::34::56
+amsdas asdfa jfha lhjdfl :: iasd uao uel
