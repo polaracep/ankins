@@ -119,6 +119,7 @@ fn main() {
 
     let anki = AnkiClient::default();
 
+    anki_create_deck(&anki, &deck_name);
     let all_note_ids_dist = anki_get_notes(&anki, deck_name);
     let all_notes_dist = anki_get_notes_info(&anki, &all_note_ids_dist);
 
@@ -180,6 +181,12 @@ fn main() {
         .for_each(|l| writeln!(writer, "{}", l).expect("Failed to write a line the file."));
 
     println!("Done.");
+}
+fn anki_create_deck(anki: &AnkiClient, deck_name: &String) {
+    anki.request(CreateDeckRequest {
+        deck: deck_name.clone(),
+    })
+    .expect("Couldn't create the deck.");
 }
 
 fn anki_add_notes(anki: &AnkiClient, notes: &Vec<AnkiNote>, name: &String) -> Vec<i64> {
