@@ -74,7 +74,7 @@ fn main() {
             let line_split: Vec<&str> = next.split(ID_DELIMETER).collect();
             note_id = parse_id(line_split.get(1).unwrap_or(&"0"));
             if note_id == 0 {
-                eprintln!("Bad id at {}.", line_count);
+                eprintln!("Bad id at line {}.", line_count);
                 continue;
             }
             next = line_split.get(0).unwrap();
@@ -122,47 +122,39 @@ fn main() {
     let all_note_ids_dist = anki_get_notes(&anki, deck_name);
     let all_notes_dist = anki_get_notes_info(&anki, &all_note_ids_dist);
 
-    dbg!(&note_db);
-    dbg!(&all_note_ids_dist);
-
     let mut new_notes: Vec<AnkiNote> = vec![];
-    let mut old_notes: Vec<AnkiNote> = vec![];
 
-    for note_info in all_notes_dist {
-        for n in note_db.iter_mut() {
-            if n.side_a.trim() != note_info.fields["Front"].value.trim()
-                || n.side_b.trim() != note_info.fields["Back"].value.trim()
+    for n in note_db.iter_mut() {
+        // if there already exists a note with the same contents, but local has no/wrong id
+        if let Some(found_duplicate) = all_notes_dist.iter().find(|x| {
+            x.fields["Front"].value.trim() == n.side_a.trim()
+                || x.fields["Back"].value.trim() == n.side_b.trim()
+        }) {
+            if found_duplicate.note_id == n.id {
+                println!("Skipping note: {}::{}", n.side_a, n.side_b);
+                continue;
+            }
+            println!(
+                "Found duplicate note with wrong id: {}::{}",
+                n.side_a, n.side_b
+            );
+            n.id = found_duplicate.note_id;
+            append_id(&mut input_lines, n);
+        } else {
+            // already have a note with this id
+            if all_notes_dist
+                .iter()
+                .any(|dist_note| dist_note.note_id == n.id)
             {
-                if n.id != note_info.note_id {
-                    continue;
-                } else {
-                    // note exists, try to update
-                    println!("Updating note: {}.", note_info.note_id);
-                    anki_update_note(&anki, &n);
-                    dbg!("+1");
-                    if old_notes.contains(&n) {
-                        panic!("Duplicates in old_notes!");
-                    }
-                    old_notes.push(n.clone());
-                }
+                println!("Found duplicate note: {}::{}", n.side_a, n.side_b);
+                continue;
             } else {
-                if n.id == 0 {
-                    println!("Restoring note id {} back", note_info.note_id);
-                    n.id = note_info.note_id;
-                }
-
-                if !old_notes.contains(&n) {
-                    old_notes.push(n.clone());
-                }
+                // finally, a new note
+                println!("Adding note: {}::{}", n.side_a, n.side_b);
+                new_notes.push(n.clone());
             }
         }
-        //let current_note = &old_notes[i];
     }
-
-    //for (i, note) in old_notes_dist.iter().enumerate() {}
-
-    dbg!(&new_notes);
-    dbg!(&old_notes);
 
     let mut new_notes_ids = anki_add_notes(&anki, &new_notes, deck_name);
 
@@ -170,7 +162,12 @@ fn main() {
     for note in new_notes.iter_mut() {
         // id uz mame
         let new_id = new_notes_ids.pop().expect("Failed to assign ids to notes.");
-        replace_id(&mut input_lines, note, new_id);
+        if note.id != 0 {
+            replace_id(&mut input_lines, note, new_id);
+        } else {
+            note.id = new_id;
+            append_id(&mut input_lines, note);
+        }
     }
 
     let file = OpenOptions::new()
@@ -232,7 +229,7 @@ fn anki_get_notes(anki: &AnkiClient, deck: &str) -> Vec<i64> {
         .0;
 }
 
-fn anki_update_note(anki: &AnkiClient, note: &AnkiNote) {
+fn _anki_update_note(anki: &AnkiClient, note: &AnkiNote) {
     return anki
         .request(UpdateNoteFieldsRequest {
             note: UpdateNoteFieldsEntry {
@@ -258,6 +255,7 @@ fn parse_id(string_id: &str) -> i64 {
 
 fn replace_id(file_lines: &mut Vec<String>, note: &AnkiNote, new_id: i64) {
     let line_n: usize;
+    // searches by note id
     match file_lines
         .iter()
         .position(|x| x.contains(&note.id.to_string()))
